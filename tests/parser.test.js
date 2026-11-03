@@ -1,6 +1,6 @@
 const assert = require('assert');
 const { parseFamPayEmail } = require('../src/services/emailParser');
-const { compareNames } = require('../src/services/matcher');
+const { compareNames, matchesPayer } = require('../src/services/matcher');
 
 console.log('🧪 Starting Parser & Matcher Unit Tests...\n');
 
@@ -69,5 +69,24 @@ assert.strictEqual(
   '"Amit Kumar" shares token "amit" with "AMIT SINGH"'
 );
 console.log('✅ Test 3 Passed: Name token matching works as expected.');
+
+// Test Case 4: matchesPayer evaluates both customer_name and customer_email
+assert.strictEqual(
+  matchesPayer(
+    { customer_name: 'test_user', customer_email: 'shanmukha.reddy@gmail.com' },
+    'SAGAMREDDY SHANMUKHA SAI REDDY'
+  ),
+  true,
+  'Email handle with matching name tokens should match payer'
+);
+assert.strictEqual(
+  matchesPayer(
+    { customer_name: 'ihackers143', customer_email: 'ihackers143@gmail.com' },
+    'SAGAMREDDY SHANMUKHA SAI REDDY'
+  ),
+  false,
+  'Unrelated handle should not match'
+);
+console.log('✅ Test 4 Passed: matchesPayer email handle token fallback works as expected.');
 
 console.log('\n🎉 ALL TESTS PASSED SUCCESSFULLY!');

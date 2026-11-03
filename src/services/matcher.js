@@ -22,6 +22,21 @@ function compareNames(customerName, senderName) {
   return custTokens.some((token) => senderTokens.includes(token));
 }
 
+/**
+ * Checks if an order's customer name or email handle matches the sender name in the bank receipt.
+ */
+function matchesPayer(order, senderName) {
+  if (!order || !senderName) return false;
+  if (compareNames(order.customer_name, senderName)) return true;
+
+  // Also check customer email prefix tokens (e.g., "sagamreddy.sai@gmail.com" matches "SAGAMREDDY")
+  if (order.customer_email) {
+    const handle = String(order.customer_email).split('@')[0].replace(/[._-]/g, ' ');
+    if (compareNames(handle, senderName)) return true;
+  }
+  return false;
+}
+
 async function markOrderPaid(order, transactionId, utr) {
   const { data: reconciled, error } = await supabase.rpc('reconcile_fampay_payment', {
     p_order_id: order.id,
@@ -173,13 +188,38 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     return { status: 'STORED_UNCLAIMED', transactionId };
   }
 
-  // 4. Lone order: match. Several orders for the same amount: match on the sender's name.
+  // 4. Lone order: match. Several orders for the same amount: match on name/email first, then smart recency.
   let matchedOrder = null;
   if (pendingOrders.length === 1) {
     matchedOrder = pendingOrders[0];
   } else {
-    matchedOrder = pendingOrders.find((ord) => compareNames(ord.customer_name, senderName)) || null;
+    // A. Priority 1: Customer name or email handle token match
+    matchedOrder = pendingOrders.find((ord) => matchesPayer(ord, senderName)) || null;
+
+    // B. Priority 2: Smart Recency Disambiguation
     if (!matchedOrder) {
+      const sortedByRecency = [...pendingOrders].sort(
+        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+      );
+      const newest = sortedByRecency[0];
+      const secondNewest = sortedByRecency[1];
+
+      const nowMs = Date.now();
+      const newestAgeSec = Math.max(0, Math.floor((nowMs - new Date(newest.created_at).getTime()) / 1000));
+      const secondAgeSec = Math.max(0, Math.floor((nowMs - new Date(secondNewest.created_at).getTime()) / 1000));
+      const ageGapSec = secondAgeSec - newestAgeSec;
+
+      // Match the newest order if it was created within the last 4 minutes (240s) AND either:
+      // - The newer order is at least 45 seconds fresher than the older order, OR
+      // - The older order was created >= 150 seconds (2.5+ minutes) ago
+      if (newestAgeSec <= 240 && (ageGapSec >= 45 || secondAgeSec >= 150)) {
+        console.log(`[MATCHER] Smart Recency: Resolved collision for ₹${amount}. Selected newest order ${newest.id} (created ${newestAgeSec}s ago vs older candidate ${secondAgeSec}s ago).`);
+        matchedOrder = newest;
+      }
+    }
+
+    if (!matchedOrder) {
+      console.warn(`[MATCHER] Unresolved collision for ₹${amount}. Multiple concurrent orders within tight time window: ${pendingOrders.map((o) => o.id).join(', ')}`);
       return {
         status: 'COLLISION_PENDING_CONFIRMATION',
         transactionId,
@@ -280,5 +320,6 @@ async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
 module.exports = {
   processIncomingPayment,
   verifyOrderByUtrOrTxnId,
-  compareNames
+  compareNames,
+  matchesPayer
 };
