@@ -99,55 +99,23 @@ async function markOrderPaid(order, transactionId, utr) {
 async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId = null, environment = 'production') {
   const { amount, transactionId, senderName, dateRaw, updatedBalance, utr } = parsedPayment;
 
-  // 1. Record in the ledger. transaction_id is unique, so a repeated email is a no-op.
-  const { error: ledgerError } = await supabase
-    .from('fampay_ledger')
-    .upsert(
-      {
-        transaction_id: transactionId,
-        utr,
-        amount,
-        sender_name: senderName,
-        raw_date: dateRaw,
-        updated_balance: updatedBalance,
-        raw_email: rawEmail,
-        merchant_id: merchantId,
-        environment
-      },
-      { onConflict: 'transaction_id', ignoreDuplicates: true }
-    );
-  if (ledgerError) {
-    console.error('[MATCHER] Ledger upsert error:', ledgerError.message);
-    return { status: 'ERROR', error: ledgerError.message };
+  if (!merchantId) {
+    console.log(`[MATCHER] Payment ${transactionId} received without merchant attribution. Ignored.`);
+    return { status: 'STORED_UNCLAIMED', transactionId };
   }
 
-  // 2. Read back the current state of this payment.
-  const { data: currentLedger } = await supabase
+  // 1. Check if this transaction was already processed and claimed
+  const { data: existingLedger } = await supabase
     .from('fampay_ledger')
     .select('*')
     .eq('transaction_id', transactionId)
     .maybeSingle();
 
-  if (!currentLedger || currentLedger.claimed) {
+  if (existingLedger && existingLedger.claimed) {
     return { status: 'ALREADY_CLAIMED', transactionId };
   }
 
-  if (!merchantId) {
-    return { status: 'STORED_UNCLAIMED', transactionId };
-  }
-
-  if (currentLedger.merchant_id && currentLedger.merchant_id !== merchantId) {
-    return { status: 'OTHER_MERCHANT', transactionId };
-  }
-
-  if (!currentLedger.merchant_id) {
-    await supabase
-      .from('fampay_ledger')
-      .update({ merchant_id: merchantId })
-      .eq('transaction_id', transactionId);
-  }
-
-  // 3. Pending, unexpired orders of this merchant with the same amount and environment.
+  // 2. Pending, unexpired orders of this merchant with the same amount and environment.
   let { data: pendingOrders, error: orderError } = await supabase
     .from('orders')
     .select('*, merchants(*)')
@@ -163,8 +131,7 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     return { status: 'ERROR', error: orderError.message };
   }
 
-  // Grace fallback: if no strictly unexpired PENDING order was found, search for orders created within
-  // the last 60 minutes for this merchant and amount (covers retries, webhook delay, or momentary expiration).
+  // Grace fallback: search for orders created within the last 60 minutes
   if (!pendingOrders || pendingOrders.length === 0) {
     const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const { data: recentOrders } = await supabase
@@ -197,8 +164,35 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     }
   }
 
+  // If no matching order was created for this merchant and amount, IGNORE the receipt.
+  // We do NOT write to fampay_ledger for unrelated personal or past payments!
   if (!pendingOrders || pendingOrders.length === 0) {
-    return { status: 'STORED_UNCLAIMED', transactionId };
+    console.log(`[MATCHER] Unrelated payment of ₹${amount} (Txn: ${transactionId}) ignored: no active order found for merchant.`);
+    return { status: 'IGNORED_NO_MATCHING_ORDER', transactionId };
+  }
+
+  // 3. Now that a matching order is confirmed, record in the ledger.
+  const targetEnv = pendingOrders[0].environment || environment;
+  const { error: ledgerError } = await supabase
+    .from('fampay_ledger')
+    .upsert(
+      {
+        transaction_id: transactionId,
+        utr,
+        amount,
+        sender_name: senderName,
+        raw_date: dateRaw,
+        updated_balance: updatedBalance,
+        raw_email: rawEmail,
+        merchant_id: merchantId,
+        environment: targetEnv
+      },
+      { onConflict: 'transaction_id', ignoreDuplicates: true }
+    );
+
+  if (ledgerError) {
+    console.error('[MATCHER] Ledger upsert error:', ledgerError.message);
+    return { status: 'ERROR', error: ledgerError.message };
   }
 
   // 4. Lone order: match. Several orders for the same amount: match on name/email first, then smart recency.
@@ -242,7 +236,7 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
   }
 
   // Ensure ledger environment matches order environment before atomic reconciliation
-  if (currentLedger.environment !== matchedOrder.environment) {
+  if (targetEnv !== matchedOrder.environment) {
     await supabase
       .from('fampay_ledger')
       .update({ environment: matchedOrder.environment })

@@ -280,12 +280,20 @@ async function getLedger(req, res) {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
 
-    const { data: ledger, error } = await supabase
+    let query = supabase
       .from('fampay_ledger')
-      .select('transaction_id, utr, amount, sender_name, raw_date, updated_balance, claimed, received_at, environment')
+      .select('transaction_id, utr, amount, sender_name, raw_date, updated_balance, claimed, order_id, received_at, environment')
       .eq('merchant_id', req.merchant.id)
       .order('received_at', { ascending: false })
       .limit(limit);
+
+    if (req.query.status === 'CLAIMED') {
+      query = query.eq('claimed', true);
+    } else if (req.query.status === 'UNCLAIMED') {
+      query = query.eq('claimed', false);
+    }
+
+    const { data: ledger, error } = await query;
 
     if (error) {
       console.error('[MERCHANT] Ledger error:', error.message);

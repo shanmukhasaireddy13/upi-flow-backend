@@ -189,6 +189,28 @@ async function processGmailPushNotification(emailAddress, historyId) {
     return;
   }
 
+  // Check for active or recently created pending orders for this merchant in the last 15 minutes.
+  // If no order was created, we never scan or import personal emails.
+  const fifteenMinutesAgo = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+  const { data: pendingOrders, error: orderLookupErr } = await supabase
+    .from('orders')
+    .select('id, amount, created_at')
+    .eq('merchant_id', merchant.id)
+    .eq('status', 'PENDING')
+    .gte('created_at', fifteenMinutesAgo);
+
+  if (orderLookupErr) {
+    console.error('[GMAIL SYNC] Error checking active orders:', orderLookupErr.message);
+  }
+
+  if (!pendingOrders || pendingOrders.length === 0) {
+    console.log(`[GMAIL SYNC] No active pending orders in the last 15 minutes for ${emailAddress}. Skipping inbox scan.`);
+    return;
+  }
+
+  const earliestOrderTimeMs = Math.min(...pendingOrders.map((o) => new Date(o.created_at).getTime()));
+  const afterEpochSec = Math.floor((earliestOrderTimeMs - 60 * 1000) / 1000);
+
   const oauth2Client = getOAuthClient();
   oauth2Client.setCredentials({
     refresh_token: merchant.google_refresh_token,
@@ -197,21 +219,20 @@ async function processGmailPushNotification(emailAddress, historyId) {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Query recent FamApp receipts. The search only narrows the list; each message is still
-  // checked for a DKIM/DMARC pass below, because the From header alone can be forged.
+  // Query only receipts that arrived after the earliest active order was created
   const listRes = await gmail.users.messages.list({
     userId: 'me',
-    q: 'from:famapp.in "successfully received"',
+    q: `from:famapp.in "successfully received" after:${afterEpochSec}`,
     maxResults: 10
   });
 
   const messages = listRes.data.messages || [];
   if (messages.length === 0) {
-    console.log(`[GMAIL SYNC] No matching FamApp emails found for ${emailAddress}.`);
+    console.log(`[GMAIL SYNC] No matching FamApp receipts found since ${new Date(earliestOrderTimeMs).toISOString()}.`);
     return;
   }
 
-  console.log(`[GMAIL SYNC] Found ${messages.length} recent FamApp email(s). Processing...`);
+  console.log(`[GMAIL SYNC] Found ${messages.length} FamApp email(s) during active order window. Processing...`);
 
   for (const msg of messages) {
     const fullMsg = await gmail.users.messages.get({
@@ -219,6 +240,13 @@ async function processGmailPushNotification(emailAddress, historyId) {
       id: msg.id,
       format: 'full'
     });
+
+    // Check email arrival timestamp against order creation window
+    const msgInternalDate = parseInt(fullMsg.data.internalDate, 10);
+    if (!isNaN(msgInternalDate) && msgInternalDate < (earliestOrderTimeMs - 60 * 1000)) {
+      console.log(`[GMAIL SYNC] Skipped email ${msg.id}: arrived at ${new Date(msgInternalDate).toISOString()} prior to active orders.`);
+      continue;
+    }
 
     const sender = verifyReceiptSender(fullMsg.data.payload.headers);
     if (!sender.ok) {
@@ -230,7 +258,14 @@ async function processGmailPushNotification(emailAddress, historyId) {
     const parsedPayment = parseFamPayEmail(bodyText);
 
     if (parsedPayment) {
-      console.log(`[GMAIL SYNC] Parsed FamApp payment: ₹${parsedPayment.amount} (${parsedPayment.transactionId})`);
+      // Amount pre-filter: only process if the receipt amount matches an active order
+      const matchesAmount = pendingOrders.some((o) => parseFloat(o.amount) === parseFloat(parsedPayment.amount));
+      if (!matchesAmount) {
+        console.log(`[GMAIL SYNC] Skipped email ${msg.id}: amount ₹${parsedPayment.amount} does not match any active order.`);
+        continue;
+      }
+
+      console.log(`[GMAIL SYNC] Parsed matching FamApp payment: ₹${parsedPayment.amount} (${parsedPayment.transactionId})`);
       await processIncomingPayment(parsedPayment, bodyText, merchant.id);
     }
   }
