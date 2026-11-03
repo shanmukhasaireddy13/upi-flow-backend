@@ -72,6 +72,17 @@ async function merchantSignup(req, res) {
       return res.status(409).json({ error: 'An account with this email already exists. Please sign in.' });
     }
 
+    if (upiId) {
+      const { data: existingUpi } = await supabase
+        .from('merchants')
+        .select('id')
+        .ilike('upi_id', upiId.toLowerCase())
+        .maybeSingle();
+      if (existingUpi) {
+        return res.status(409).json({ error: 'This FamPay UPI ID is already linked to another merchant account.' });
+      }
+    }
+
     const { data: merchant, error } = await supabase
       .from('merchants')
       .insert({
@@ -206,7 +217,10 @@ async function handleGoogleCallback(req, res) {
     ));
   } catch (err) {
     console.error('[AUTH CONTROLLER] Callback error:', err.message);
-    return res.status(500).send(page('Connection failed', 'We could not finish connecting Gmail. Try again.', false));
+    const userMessage = err.message && err.message.includes('already connected')
+      ? err.message
+      : 'We could not finish connecting Gmail. Try again.';
+    return res.status(400).send(page('Connection failed', userMessage, false));
   }
 }
 

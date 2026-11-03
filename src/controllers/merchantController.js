@@ -151,6 +151,17 @@ async function updateMerchantSettings(req, res) {
       if (!upi || !isFamPayVpa(upi)) {
         errors.push('Enter a valid FamPay UPI ID ending with @fam, for example yourhandle@fam');
       } else {
+        if (upi.toLowerCase() !== String(req.merchant.upi_id || '').toLowerCase()) {
+          const { data: existingUpi } = await supabase
+            .from('merchants')
+            .select('id')
+            .ilike('upi_id', upi.toLowerCase())
+            .neq('id', req.merchant.id)
+            .maybeSingle();
+          if (existingUpi) {
+            errors.push('This FamPay UPI ID is already linked to another merchant account.');
+          }
+        }
         updates.upi_id = upi;
       }
     }

@@ -62,12 +62,17 @@ async function handleOAuthCallback(code, merchantId) {
     updateData.google_refresh_token = tokens.refresh_token;
   }
 
-  // Ensure this google_email is not held by another merchant
-  await supabase
+  // Do not allow multiple accounts to use the same Google Gmail account
+  const { data: existingGoogle } = await supabase
     .from('merchants')
-    .update({ google_email: null, google_access_token: null, google_refresh_token: null })
-    .eq('google_email', userEmail)
-    .neq('id', merchantId);
+    .select('id')
+    .ilike('google_email', userEmail.toLowerCase())
+    .neq('id', merchantId)
+    .maybeSingle();
+
+  if (existingGoogle) {
+    throw new Error(`This Gmail account (${userEmail}) is already connected to another merchant account.`);
+  }
 
   const { data: updatedMerchant, error } = await supabase
     .from('merchants')
