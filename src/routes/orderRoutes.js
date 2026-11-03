@@ -18,6 +18,7 @@ router.post('/', createLimiter, authenticate, createOrder);
 router.get('/list', authenticate, listOrders);
 // Public, read-only status for the hosted checkout page. Order IDs are unguessable.
 router.get('/status/:id', statusLimiter, getOrderStatus);
+router.get('/:id', statusLimiter, getOrderStatus);
 router.post('/verify-utr', verifyLimiter, verifyUtrFallback);
 
 module.exports = router;
