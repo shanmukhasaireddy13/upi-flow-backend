@@ -4,7 +4,7 @@ const { isPaymentReference } = require('../lib/validation');
 
 /**
  * Compares two names by extracting meaningful tokens (> 2 characters).
- * e.g., "Shanmukha Reddy" matches "SAGAMREDDY SHANMUKHA SAI REDDY"
+ * e.g., "Aarav Sharma" matches "SHARMA AARAV KUMAR"
  */
 function compareNames(customerName, senderName) {
   if (!customerName || !senderName) return false;
@@ -29,7 +29,7 @@ function matchesPayer(order, senderName) {
   if (!order || !senderName) return false;
   if (compareNames(order.customer_name, senderName)) return true;
 
-  // Also check customer email prefix tokens (e.g., "sagamreddy.sai@gmail.com" matches "SAGAMREDDY")
+  // Also check customer email prefix tokens (e.g., "aarav.sharma@gmail.com" matches "SHARMA")
   if (order.customer_email) {
     const handle = String(order.customer_email).split('@')[0].replace(/[._-]/g, ' ');
     if (compareNames(handle, senderName)) return true;

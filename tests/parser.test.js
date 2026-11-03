@@ -5,10 +5,10 @@ const { compareNames, matchesPayer } = require('../src/services/matcher');
 console.log('🧪 Starting Parser & Matcher Unit Tests...\n');
 
 // Test Case 1: Live email from Nov 02, 2026 (Includes UTR)
-const liveEmailNov2026 = `Hey Sagamreddy Shanmukha Sai Reddy,
+const liveEmailNov2026 = `Hey Aarav Sharma,
 You have successfully received
 ₹1.0
-from SAGAMREDDY SHANMUKHA SAI REDDY
+from AARAV SHARMA
 Transaction ID :
 FMPIB6910395893
 Date :
@@ -26,12 +26,12 @@ const parsed1 = parseFamPayEmail(liveEmailNov2026);
 assert.strictEqual(parsed1.amount, 1.0, 'Amount should be 1.0');
 assert.strictEqual(parsed1.transactionId, 'FMPIB6910395893', 'Transaction ID should be FMPIB6910395893');
 assert.strictEqual(parsed1.utr, '945756689182', 'UTR should be 945756689182');
-assert.strictEqual(parsed1.senderName, 'SAGAMREDDY SHANMUKHA SAI REDDY', 'Sender name should match');
+assert.strictEqual(parsed1.senderName, 'AARAV SHARMA', 'Sender name should match');
 assert.strictEqual(parsed1.updatedBalance, 3.02, 'Updated balance should be 3.02');
 console.log('✅ Test 1 Passed: Live email parsed with 100% accuracy (including UTR).');
 
 // Test Case 2: Multi-thousand rupee amount with comma formatting
-const largeAmountEmail = `Hey Sagamreddy Shanmukha Sai Reddy,
+const largeAmountEmail = `Hey Aarav Sharma,
 You have successfully received
 ₹1,499.00
 from RAHUL SHARMA
@@ -54,14 +54,14 @@ console.log('✅ Test 2 Passed: Comma-formatted rupee amounts parse cleanly.');
 
 // Test Case 3: Name token matching (Fuzzy token comparison)
 assert.strictEqual(
-  compareNames('Shanmukha Reddy', 'SAGAMREDDY SHANMUKHA SAI REDDY'),
+  compareNames('Aarav Sharma', 'SHARMA AARAV KUMAR'),
   true,
-  'Customer "Shanmukha Reddy" should match bank sender "SAGAMREDDY SHANMUKHA SAI REDDY"'
+  'Customer "Aarav Sharma" should match bank sender "SHARMA AARAV KUMAR"'
 );
 assert.strictEqual(
-  compareNames('Rahul', 'SAGAMREDDY SHANMUKHA SAI REDDY'),
+  compareNames('Rahul', 'SHARMA AARAV KUMAR'),
   false,
-  'Customer "Rahul" should NOT match "SAGAMREDDY SHANMUKHA SAI REDDY"'
+  'Customer "Rahul" should NOT match "SHARMA AARAV KUMAR"'
 );
 assert.strictEqual(
   compareNames('Amit Kumar', 'AMIT SINGH'),
@@ -73,8 +73,8 @@ console.log('✅ Test 3 Passed: Name token matching works as expected.');
 // Test Case 4: matchesPayer evaluates both customer_name and customer_email
 assert.strictEqual(
   matchesPayer(
-    { customer_name: 'test_user', customer_email: 'shanmukha.reddy@gmail.com' },
-    'SAGAMREDDY SHANMUKHA SAI REDDY'
+    { customer_name: 'test_user', customer_email: 'aarav.sharma@gmail.com' },
+    'SHARMA AARAV KUMAR'
   ),
   true,
   'Email handle with matching name tokens should match payer'
@@ -82,7 +82,7 @@ assert.strictEqual(
 assert.strictEqual(
   matchesPayer(
     { customer_name: 'ihackers143', customer_email: 'ihackers143@gmail.com' },
-    'SAGAMREDDY SHANMUKHA SAI REDDY'
+    'SHARMA AARAV KUMAR'
   ),
   false,
   'Unrelated handle should not match'

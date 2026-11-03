@@ -9,7 +9,8 @@ async function testGmailFetch() {
   const { data: merchant } = await supabase
     .from('merchants')
     .select('*')
-    .eq('google_email', 's.shanmukhasaireddy@gmail.com')
+    .not('google_refresh_token', 'is', null)
+    .limit(1)
     .single();
 
   if (!merchant || !merchant.google_refresh_token) {

@@ -10,7 +10,7 @@ async function runIntegrationTest() {
 
   const testOrderId = `test_ord_${Date.now().toString(36)}`;
   const testAmount = 50.0;
-  const testCustomerName = 'Shanmukha Reddy';
+  const testCustomerName = 'Aarav Sharma';
   const expiresAt = new Date(Date.now() + 5 * 60 * 1000).toISOString();
 
   // 1. Fetch Default Merchant
@@ -30,7 +30,7 @@ async function runIntegrationTest() {
       id: testOrderId,
       merchant_id: merchant.id,
       customer_name: testCustomerName,
-      customer_email: 'shanmukha@test.local',
+      customer_email: 'aarav@test.local',
       amount: testAmount,
       status: 'PENDING',
       expires_at: expiresAt
@@ -46,10 +46,10 @@ async function runIntegrationTest() {
   const testTxnId = `FMPIB${Math.floor(1000000000 + Math.random() * 9000000000)}`;
   const testUtr = `${Math.floor(100000000000 + Math.random() * 900000000000)}`;
 
-  const mockEmail = `Hey Sagamreddy Shanmukha Sai Reddy,
+  const mockEmail = `Hey Aarav Sharma,
 You have successfully received
 ₹${testAmount.toFixed(1)}
-from SAGAMREDDY SHANMUKHA SAI REDDY
+from AARAV SHARMA
 Transaction ID :
 ${testTxnId}
 Date :
