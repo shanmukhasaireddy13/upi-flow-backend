@@ -1,0 +1,23 @@
+{
+  "name": "upi-flow-backend",
+  "version": "1.0.0",
+  "description": "Zero-fee Non-custodial UPI Payment Gateway Backend with FamPay Email Ingestion",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "server": "nodemon src/server.js",
+    "dev": "nodemon src/server.js",
+    "test": "node tests/parser.test.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^4.21.2",
+    "googleapis": "^189.0.0",
+    "imap": "^0.8.19",
+    "mailparser": "^3.7.2",
+    "nodemon": "^3.1.14",
+    "qrcode": "^1.5.4"
+  }
+}

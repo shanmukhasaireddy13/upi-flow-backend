@@ -1,0 +1,284 @@
+const { supabase } = require('../config/supabase');
+const { dispatchMerchantWebhook } = require('./webhookService');
+const { isPaymentReference } = require('../lib/validation');
+
+/**
+ * Compares two names by extracting meaningful tokens (> 2 characters).
+ * e.g., "Shanmukha Reddy" matches "SAGAMREDDY SHANMUKHA SAI REDDY"
+ */
+function compareNames(customerName, senderName) {
+  if (!customerName || !senderName) return false;
+
+  const clean = (str) =>
+    str
+      .toLowerCase()
+      .replace(/[^a-z0-9 ]/g, '')
+      .split(/\s+/)
+      .filter((t) => t.length > 2);
+
+  const custTokens = clean(customerName);
+  const senderTokens = clean(senderName);
+
+  return custTokens.some((token) => senderTokens.includes(token));
+}
+
+async function markOrderPaid(order, transactionId, utr) {
+  const { data: reconciled, error } = await supabase.rpc('reconcile_fampay_payment', {
+    p_order_id: order.id,
+    p_transaction_id: transactionId,
+    p_utr: utr
+  });
+  if (!error && Boolean(reconciled)) {
+    return { ok: true };
+  }
+
+  if (error) {
+    console.warn('[MATCHER] RPC error executing reconcile_fampay_payment:', error.message, '- applying direct reconciliation');
+  }
+
+  // Direct fallback update
+  const { error: orderUpdateErr } = await supabase
+    .from('orders')
+    .update({
+      status: 'PAID',
+      transaction_id: transactionId,
+      utr: utr || null,
+      updated_at: new Date().toISOString()
+    })
+    .eq('id', order.id);
+
+  if (orderUpdateErr) {
+    console.error('[MATCHER] Direct order update error:', orderUpdateErr.message);
+    return { ok: false, error: orderUpdateErr.message };
+  }
+
+  await supabase
+    .from('fampay_ledger')
+    .update({
+      claimed: true,
+      order_id: order.id
+    })
+    .eq('transaction_id', transactionId);
+
+  return { ok: true };
+}
+
+/**
+ * Reconciles an incoming parsed FamApp payment with pending orders of ONE merchant.
+ * The merchant must be known (resolved from the receiving Gmail account or the authenticated caller).
+ * Without it we cannot tell whose payment this is, so it is stored unclaimed rather than matched.
+ */
+async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId = null, environment = 'production') {
+  const { amount, transactionId, senderName, dateRaw, updatedBalance, utr } = parsedPayment;
+
+  // 1. Record in the ledger. transaction_id is unique, so a repeated email is a no-op.
+  const { error: ledgerError } = await supabase
+    .from('fampay_ledger')
+    .upsert(
+      {
+        transaction_id: transactionId,
+        utr,
+        amount,
+        sender_name: senderName,
+        raw_date: dateRaw,
+        updated_balance: updatedBalance,
+        raw_email: rawEmail,
+        merchant_id: merchantId,
+        environment
+      },
+      { onConflict: 'transaction_id', ignoreDuplicates: true }
+    );
+  if (ledgerError) {
+    console.error('[MATCHER] Ledger upsert error:', ledgerError.message);
+    return { status: 'ERROR', error: ledgerError.message };
+  }
+
+  // 2. Read back the current state of this payment.
+  const { data: currentLedger } = await supabase
+    .from('fampay_ledger')
+    .select('*')
+    .eq('transaction_id', transactionId)
+    .maybeSingle();
+
+  if (!currentLedger || currentLedger.claimed) {
+    return { status: 'ALREADY_CLAIMED', transactionId };
+  }
+
+  if (!merchantId) {
+    return { status: 'STORED_UNCLAIMED', transactionId };
+  }
+
+  if (currentLedger.merchant_id && currentLedger.merchant_id !== merchantId) {
+    return { status: 'OTHER_MERCHANT', transactionId };
+  }
+
+  if (!currentLedger.merchant_id) {
+    await supabase
+      .from('fampay_ledger')
+      .update({ merchant_id: merchantId })
+      .eq('transaction_id', transactionId);
+  }
+
+  // 3. Pending, unexpired orders of this merchant with the same amount and environment.
+  let { data: pendingOrders, error: orderError } = await supabase
+    .from('orders')
+    .select('*, merchants(*)')
+    .eq('merchant_id', merchantId)
+    .eq('environment', environment)
+    .eq('status', 'PENDING')
+    .eq('amount', amount)
+    .gt('expires_at', new Date().toISOString())
+    .order('created_at', { ascending: true });
+
+  if (orderError) {
+    console.error('[MATCHER] Error querying pending orders:', orderError.message);
+    return { status: 'ERROR', error: orderError.message };
+  }
+
+  // Grace fallback: if no strictly unexpired PENDING order was found, search for orders created within
+  // the last 60 minutes for this merchant and amount (covers retries, webhook delay, or momentary expiration).
+  if (!pendingOrders || pendingOrders.length === 0) {
+    const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const { data: recentOrders } = await supabase
+      .from('orders')
+      .select('*, merchants(*)')
+      .eq('merchant_id', merchantId)
+      .eq('environment', environment)
+      .in('status', ['PENDING', 'EXPIRED'])
+      .eq('amount', amount)
+      .gte('created_at', sixtyMinutesAgo)
+      .order('created_at', { ascending: false });
+
+    if (recentOrders && recentOrders.length > 0) {
+      pendingOrders = recentOrders;
+    } else if (environment === 'production') {
+      // Check if this merchant created an order in dev mode
+      const { data: devOrders } = await supabase
+        .from('orders')
+        .select('*, merchants(*)')
+        .eq('merchant_id', merchantId)
+        .eq('environment', 'dev')
+        .in('status', ['PENDING', 'EXPIRED'])
+        .eq('amount', amount)
+        .gte('created_at', sixtyMinutesAgo)
+        .order('created_at', { ascending: false });
+
+      if (devOrders && devOrders.length > 0) {
+        pendingOrders = devOrders;
+      }
+    }
+  }
+
+  if (!pendingOrders || pendingOrders.length === 0) {
+    return { status: 'STORED_UNCLAIMED', transactionId };
+  }
+
+  // 4. Lone order: match. Several orders for the same amount: match on the sender's name.
+  let matchedOrder = null;
+  if (pendingOrders.length === 1) {
+    matchedOrder = pendingOrders[0];
+  } else {
+    matchedOrder = pendingOrders.find((ord) => compareNames(ord.customer_name, senderName)) || null;
+    if (!matchedOrder) {
+      return {
+        status: 'COLLISION_PENDING_CONFIRMATION',
+        transactionId,
+        candidateOrders: pendingOrders.map((o) => o.id)
+      };
+    }
+  }
+
+  // Ensure ledger environment matches order environment before atomic reconciliation
+  if (currentLedger.environment !== matchedOrder.environment) {
+    await supabase
+      .from('fampay_ledger')
+      .update({ environment: matchedOrder.environment })
+      .eq('transaction_id', transactionId);
+  }
+
+  // 5. Atomic reconciliation in PostgreSQL.
+  const result = await markOrderPaid(matchedOrder, transactionId, utr);
+  if (!result.ok) {
+    return { status: 'RECONCILIATION_FAILED', error: result.error };
+  }
+
+  const paidOrder = { ...matchedOrder, status: 'PAID', transaction_id: transactionId, utr };
+  await dispatchMerchantWebhook(matchedOrder.merchants, 'order.paid', paidOrder);
+  return { status: 'PAID', orderId: matchedOrder.id, transactionId, utr };
+}
+
+/**
+ * Manual fallback: the customer types the UTR or FamPay transaction ID of a payment they made.
+ * Only payments attributed to the order's own merchant and with the exact amount can be claimed.
+ */
+async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
+  const reference = String(referenceInput || '').trim();
+  if (!isPaymentReference(reference)) {
+    return { success: false, message: 'Enter the 12-digit UTR or the FamPay transaction ID' };
+  }
+
+  const { data: order, error: orderError } = await supabase
+    .from('orders')
+    .select('*, merchants(*)')
+    .eq('id', orderId)
+    .maybeSingle();
+
+  if (orderError || !order) {
+    return { success: false, message: 'Order not found' };
+  }
+  if (order.status === 'PAID') {
+    return { success: true, message: 'This order is already paid', orderId: order.id, utr: order.utr };
+  }
+  const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000);
+  const isRecent = new Date(order.created_at) >= sixtyMinutesAgo;
+  if (!['PENDING', 'EXPIRED'].includes(order.status) || !isRecent) {
+    return { success: false, message: 'This checkout session has expired' };
+  }
+
+  // The reference is validated as alphanumeric above, so it is safe inside the PostgREST filter.
+  const { data: entries, error: ledgerError } = await supabase
+    .from('fampay_ledger')
+    .select('*')
+    .eq('merchant_id', order.merchant_id)
+    .eq('environment', order.environment || 'production')
+    .eq('claimed', false)
+    .or(`utr.eq.${reference},transaction_id.eq.${reference}`)
+    .limit(1);
+
+  if (ledgerError || !entries || entries.length === 0) {
+    return {
+      success: false,
+      message: 'No matching unclaimed payment found. If you just paid, wait a few seconds and try again.'
+    };
+  }
+
+  const ledger = entries[0];
+  if (Number(ledger.amount) !== Number(order.amount)) {
+    return {
+      success: false,
+      message: `This payment is ₹${ledger.amount}, but the order is ₹${order.amount}`
+    };
+  }
+
+  const result = await markOrderPaid(order, ledger.transaction_id, ledger.utr);
+  if (!result.ok) {
+    return { success: false, message: 'This payment was already claimed by another order' };
+  }
+
+  const paidOrder = { ...order, status: 'PAID', transaction_id: ledger.transaction_id, utr: ledger.utr };
+  await dispatchMerchantWebhook(order.merchants, 'order.paid', paidOrder);
+
+  return {
+    success: true,
+    message: 'Payment verified',
+    orderId: order.id,
+    transactionId: ledger.transaction_id,
+    utr: ledger.utr
+  };
+}
+
+module.exports = {
+  processIncomingPayment,
+  verifyOrderByUtrOrTxnId,
+  compareNames
+};
