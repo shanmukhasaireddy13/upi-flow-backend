@@ -3,6 +3,7 @@ const { supabase } = require('../config/supabase');
 const { parseFamPayEmail } = require('./emailParser');
 const { processIncomingPayment } = require('./matcher');
 const { signToken } = require('../lib/session');
+const { verifyReceiptSender } = require('../lib/receiptAuth');
 
 const SCOPES = [
   'https://www.googleapis.com/auth/gmail.readonly',
@@ -191,10 +192,11 @@ async function processGmailPushNotification(emailAddress, historyId) {
 
   const gmail = google.gmail({ version: 'v1', auth: oauth2Client });
 
-  // Query recent matching emails for FamApp transaction receipts
+  // Query recent FamApp receipts. The search only narrows the list; each message is still
+  // checked for a DKIM/DMARC pass below, because the From header alone can be forged.
   const listRes = await gmail.users.messages.list({
     userId: 'me',
-    q: 'from:no-reply@famapp.in OR "successfully received"',
+    q: 'from:famapp.in "successfully received"',
     maxResults: 10
   });
 
@@ -212,6 +214,12 @@ async function processGmailPushNotification(emailAddress, historyId) {
       id: msg.id,
       format: 'full'
     });
+
+    const sender = verifyReceiptSender(fullMsg.data.payload.headers);
+    if (!sender.ok) {
+      console.warn(`[GMAIL SYNC] Ignored message ${msg.id}: ${sender.reason}`);
+      continue;
+    }
 
     const bodyText = extractBodyFromPayload(fullMsg.data.payload);
     const parsedPayment = parseFamPayEmail(bodyText);

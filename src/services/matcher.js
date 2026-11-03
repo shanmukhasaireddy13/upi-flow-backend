@@ -43,16 +43,29 @@ async function markOrderPaid(order, transactionId, utr) {
     p_transaction_id: transactionId,
     p_utr: utr
   });
-  if (!error && Boolean(reconciled)) {
-    return { ok: true };
+  // The function ran: its answer is final. `false` means the payment or the order was already taken.
+  if (!error) {
+    return reconciled ? { ok: true } : { ok: false, error: 'Payment already claimed or order not payable' };
   }
 
-  if (error) {
-    console.warn('[MATCHER] RPC error executing reconcile_fampay_payment:', error.message, '- applying direct reconciliation');
+  console.warn('[MATCHER] RPC error executing reconcile_fampay_payment:', error.message, '- applying guarded reconciliation');
+
+  // Fallback without the database function. Each step only succeeds if the row is still in the expected
+  // state, so two concurrent requests cannot both claim one payment or both pay one order.
+  // 1. Claim the payment.
+  const { data: claimedRows, error: claimErr } = await supabase
+    .from('fampay_ledger')
+    .update({ claimed: true, order_id: order.id })
+    .eq('transaction_id', transactionId)
+    .eq('claimed', false)
+    .select('transaction_id');
+
+  if (claimErr || !claimedRows || claimedRows.length === 0) {
+    return { ok: false, error: claimErr ? claimErr.message : 'Payment already claimed' };
   }
 
-  // Direct fallback update
-  const { error: orderUpdateErr } = await supabase
+  // 2. Pay the order, only if it is still unpaid.
+  const { data: paidRows, error: orderUpdateErr } = await supabase
     .from('orders')
     .update({
       status: 'PAID',
@@ -60,20 +73,20 @@ async function markOrderPaid(order, transactionId, utr) {
       utr: utr || null,
       updated_at: new Date().toISOString()
     })
-    .eq('id', order.id);
+    .eq('id', order.id)
+    .in('status', ['PENDING', 'EXPIRED'])
+    .select('id');
 
-  if (orderUpdateErr) {
-    console.error('[MATCHER] Direct order update error:', orderUpdateErr.message);
-    return { ok: false, error: orderUpdateErr.message };
+  if (orderUpdateErr || !paidRows || paidRows.length === 0) {
+    // Release the payment so it can still be matched to the right order.
+    await supabase
+      .from('fampay_ledger')
+      .update({ claimed: false, order_id: null })
+      .eq('transaction_id', transactionId)
+      .eq('order_id', order.id);
+    if (orderUpdateErr) console.error('[MATCHER] Direct order update error:', orderUpdateErr.message);
+    return { ok: false, error: orderUpdateErr ? orderUpdateErr.message : 'Order is no longer payable' };
   }
-
-  await supabase
-    .from('fampay_ledger')
-    .update({
-      claimed: true,
-      order_id: order.id
-    })
-    .eq('transaction_id', transactionId);
 
   return { ok: true };
 }

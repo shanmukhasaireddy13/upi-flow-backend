@@ -3,6 +3,7 @@ const { simpleParser } = require('mailparser');
 const { parseFamPayEmail } = require('./emailParser');
 const { processIncomingPayment } = require('./matcher');
 const { supabase } = require('../config/supabase');
+const { verifyReceiptSender } = require('../lib/receiptAuth');
 
 class ImapIdleService {
   constructor(config = {}) {
@@ -71,15 +72,9 @@ class ImapIdleService {
   }
 
   fetchLatestEmail() {
+    // Only FamApp senders. Each message is still checked for a DKIM/DMARC pass in fetchAndProcess.
     this.imap.search(['UNSEEN', ['FROM', 'famapp.in']], (err, results) => {
-      if (err || !results || results.length === 0) {
-        // Fallback: search for any UNSEEN message with "successfully received"
-        this.imap.search(['UNSEEN'], (fallbackErr, fallbackResults) => {
-          if (fallbackErr || !fallbackResults || fallbackResults.length === 0) return;
-          this.fetchAndProcess(fallbackResults[fallbackResults.length - 1]);
-        });
-        return;
-      }
+      if (err || !results || results.length === 0) return;
       this.fetchAndProcess(results[results.length - 1]);
     });
   }
@@ -92,6 +87,16 @@ class ImapIdleService {
         simpleParser(stream, async (err, parsed) => {
           if (err) {
             console.error('[IMAP IDLE] Error parsing email stream:', err.message);
+            return;
+          }
+
+          const headers = (parsed.headerLines || []).map(({ key, line }) => ({
+            name: key,
+            value: line.slice(line.indexOf(':') + 1)
+          }));
+          const sender = verifyReceiptSender(headers);
+          if (!sender.ok) {
+            console.warn(`[IMAP IDLE] Ignored message ${msgId}: ${sender.reason}`);
             return;
           }
 

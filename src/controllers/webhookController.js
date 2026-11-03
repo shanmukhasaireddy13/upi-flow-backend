@@ -1,4 +1,5 @@
 const crypto = require('crypto');
+const { OAuth2Client } = require('google-auth-library');
 const { parseFamPayEmail } = require('../services/emailParser');
 const { processIncomingPayment } = require('../services/matcher');
 const { supabase } = require('../config/supabase');
@@ -98,15 +99,43 @@ async function handleMockPayment(req, res) {
   }
 }
 
+const oidcClient = new OAuth2Client();
+
 /**
- * Google Cloud Pub/Sub push endpoint. The subscription URL must include ?token=PUBSUB_VERIFICATION_TOKEN.
- * Requests without the token are rejected so nobody can inject payments.
+ * A push request is genuine when it carries ?token=PUBSUB_VERIFICATION_TOKEN, or a Google-signed OIDC
+ * token for PUBSUB_AUDIENCE issued to PUBSUB_SERVICE_ACCOUNT (authenticated push subscriptions).
+ */
+async function isPubSubRequestAuthorized(req) {
+  const expected = process.env.PUBSUB_VERIFICATION_TOKEN;
+  if (req.query.token && expected && safeEqual(req.query.token, expected)) return true;
+
+  const audience = process.env.PUBSUB_AUDIENCE;
+  const serviceAccount = process.env.PUBSUB_SERVICE_ACCOUNT;
+  const authHeader = req.headers.authorization || '';
+  if (!audience || !serviceAccount || !/^Bearer\s+/i.test(authHeader)) return false;
+
+  try {
+    const ticket = await oidcClient.verifyIdToken({
+      idToken: authHeader.replace(/^Bearer\s+/i, '').trim(),
+      audience
+    });
+    const payload = ticket.getPayload() || {};
+    return payload.email === serviceAccount && payload.email_verified === true;
+  } catch (err) {
+    return false;
+  }
+}
+
+/**
+ * Google Cloud Pub/Sub push endpoint. Every request must be authenticated (see isPubSubRequestAuthorized),
+ * otherwise anyone could trigger Gmail syncs for any merchant or inject receipt text.
  */
 async function handlePubSubWebhook(req, res) {
   try {
-    const expected = process.env.PUBSUB_VERIFICATION_TOKEN;
-    const token = req.query.token;
-    const isTokenValid = Boolean(token && expected && safeEqual(token, expected));
+    if (!(await isPubSubRequestAuthorized(req))) {
+      console.warn('[PUBSUB] Rejected unauthenticated push request');
+      return res.status(401).send('Unauthorized');
+    }
 
     if (!req.body || !req.body.message || !req.body.message.data) {
       return res.status(400).send('Bad Request: invalid Pub/Sub message');
@@ -122,9 +151,8 @@ async function handlePubSubWebhook(req, res) {
     }
 
     if (notification && notification.historyId && notification.emailAddress) {
-      // Gmail push notification: { emailAddress, historyId }.
-      // This is secure without a URL token because no payment data is accepted from the webhook:
-      // the backend fetches the actual email directly via Google Gmail API using the merchant's stored OAuth token.
+      // Gmail push notification: { emailAddress, historyId }. No payment data is taken from it:
+      // the backend fetches the emails itself with the merchant's OAuth token and checks their DKIM.
       console.log(`[PUBSUB] Received Gmail push notification for: ${notification.emailAddress} (HistoryId: ${notification.historyId})`);
       const merchantId = await resolveMerchantIdByEmail(notification.emailAddress);
       if (merchantId) {
@@ -136,12 +164,6 @@ async function handlePubSubWebhook(req, res) {
         console.warn(`[PUBSUB] Gmail push for unknown mailbox ${notification.emailAddress} was ignored`);
       }
       return res.status(200).send('OK');
-    }
-
-    // If it is NOT a Gmail push notification (e.g. raw receipt payload), require valid token
-    if (!isTokenValid) {
-      console.warn('[PUBSUB] Rejected unauthenticated non-Gmail payload');
-      return res.status(401).send('Unauthorized');
     }
 
     // Pasted or forwarded receipt text authenticated via token
