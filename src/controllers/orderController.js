@@ -2,7 +2,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { supabase } = require('../config/supabase');
 const { verifyOrderByUtrOrTxnId } = require('../services/matcher');
-const { parseAmount, parseString, isEmail, isOrderId, isValidRedirectUrl } = require('../lib/validation');
+const { parseAmount, parseString, isEmail, isOrderId, isValidRedirectUrl, isFamPayVpa } = require('../lib/validation');
 
 const ORDER_TTL_MS = 5 * 60 * 1000;
 const CHECKOUT_BASE_URL = (process.env.CHECKOUT_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
@@ -61,8 +61,12 @@ async function createOrder(req, res) {
       metadata = req.body.metadata;
     }
 
-    if (!merchant.upi_id) {
-      return res.status(400).json({ error: 'Set a receiving UPI ID in settings before creating payments' });
+    if (!merchant.upi_id || !isFamPayVpa(merchant.upi_id)) {
+      return res.status(400).json({ error: 'Configure your FamPay UPI ID (@fam) in settings before creating payments' });
+    }
+
+    if (!merchant.google_email) {
+      return res.status(400).json({ error: 'Connect your Gmail account in settings to verify payments before creating payments' });
     }
 
     const orderId = `ord_${crypto.randomBytes(12).toString('base64url')}`;
@@ -70,7 +74,7 @@ async function createOrder(req, res) {
     const upiUri = buildUpiUri(merchant.upi_id, merchant.upi_name || merchant.name, amount);
     const qrCode = await QRCode.toDataURL(upiUri, qrOptions());
 
-    const env = req.environment || 'dev';
+    const env = 'production';
     const { data: order, error } = await supabase
       .from('orders')
       .insert({
@@ -227,12 +231,10 @@ async function listOrders(req, res) {
     const allowedStatus = ['PENDING', 'PAID', 'EXPIRED'];
     const status = allowedStatus.includes(req.query.status) ? req.query.status : null;
 
-    const env = req.environment || 'dev';
     let query = supabase
       .from('orders')
       .select('id, amount, customer_name, customer_email, status, transaction_id, utr, expires_at, created_at, environment')
       .eq('merchant_id', req.merchant.id)
-      .eq('environment', env)
       .order('created_at', { ascending: false })
       .limit(limit);
 

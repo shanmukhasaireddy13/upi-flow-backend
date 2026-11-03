@@ -18,13 +18,12 @@ const {
 async function getMerchantProfile(req, res) {
   try {
     const merchant = req.merchant;
-    const env = req.environment || 'dev';
+    const env = 'production';
 
     const { data: orders, error } = await supabase
       .from('orders')
       .select('amount, status')
-      .eq('merchant_id', merchant.id)
-      .eq('environment', env);
+      .eq('merchant_id', merchant.id);
 
     if (error) {
       return res.status(500).json({ error: 'Could not load metrics' });
@@ -40,10 +39,7 @@ async function getMerchantProfile(req, res) {
       merchant: {
         ...publicMerchant(merchant),
         api_key: merchant.api_key,
-        test_api_key: merchant.test_api_key,
-        webhook_secret: merchant.webhook_secret,
-        test_webhook_secret: merchant.test_webhook_secret,
-        test_webhook_url: merchant.test_webhook_url
+        webhook_secret: merchant.webhook_secret
       },
       metrics: {
         total_volume: totalVolume.toFixed(2),
@@ -234,13 +230,6 @@ async function updateMerchantSettings(req, res) {
  * Issues a new API key. The old key stops working immediately.
  */
 async function rotateApiKey(req, res) {
-  const isDev = req.environment === 'dev';
-  if (isDev) {
-    const testApiKey = `sk_test_${crypto.randomBytes(24).toString('base64url')}`;
-    const { error } = await supabase.from('merchants').update({ test_api_key: testApiKey }).eq('id', req.merchant.id);
-    if (error) return res.status(500).json({ error: 'Could not rotate development API key' });
-    return res.json({ success: true, api_key: testApiKey, environment: 'dev' });
-  }
   const apiKey = `sk_live_${crypto.randomBytes(24).toString('base64url')}`;
   const { error } = await supabase.from('merchants').update({ api_key: apiKey }).eq('id', req.merchant.id);
   if (error) return res.status(500).json({ error: 'Could not rotate the API key' });
@@ -251,14 +240,7 @@ async function rotateApiKey(req, res) {
  * Issues a new webhook signing secret. Merchants must update their verifier before the next event.
  */
 async function rotateWebhookSecret(req, res) {
-  const isDev = req.environment === 'dev';
-  if (isDev) {
-    const testSecret = `whsec_test_${crypto.randomBytes(24).toString('base64url')}`;
-    const { error } = await supabase.from('merchants').update({ test_webhook_secret: testSecret }).eq('id', req.merchant.id);
-    if (error) return res.status(500).json({ error: 'Could not rotate development webhook secret' });
-    return res.json({ success: true, webhook_secret: testSecret, environment: 'dev' });
-  }
-  const secret = `whsec_${crypto.randomBytes(24).toString('base64url')}`;
+  const secret = `whsec_live_${crypto.randomBytes(24).toString('base64url')}`;
   const { error } = await supabase.from('merchants').update({ webhook_secret: secret }).eq('id', req.merchant.id);
   if (error) return res.status(500).json({ error: 'Could not rotate the webhook secret' });
   return res.json({ success: true, webhook_secret: secret, environment: 'production' });
@@ -268,15 +250,15 @@ async function rotateWebhookSecret(req, res) {
  * Sends a signed test event to the configured webhook URL.
  */
 async function sendWebhookTest(req, res) {
-  const result = await sendTestWebhook(req.merchant, req.environment || 'dev');
+  const result = await sendTestWebhook(req.merchant, 'production');
   if (result.delivered) {
-    return res.json({ success: true, status: result.status, environment: req.environment || 'dev' });
+    return res.json({ success: true, status: result.status, environment: 'production' });
   }
   return res.status(502).json({
     success: false,
     error: result.reason || `Endpoint responded with HTTP ${result.status}`,
     status: result.status || null,
-    environment: req.environment || 'dev'
+    environment: 'production'
   });
 }
 
@@ -286,13 +268,11 @@ async function sendWebhookTest(req, res) {
 async function getLedger(req, res) {
   try {
     const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 50, 1), 200);
-    const env = req.environment || 'dev';
 
     const { data: ledger, error } = await supabase
       .from('fampay_ledger')
       .select('transaction_id, utr, amount, sender_name, raw_date, updated_balance, claimed, received_at, environment')
       .eq('merchant_id', req.merchant.id)
-      .eq('environment', env)
       .order('received_at', { ascending: false })
       .limit(limit);
 
