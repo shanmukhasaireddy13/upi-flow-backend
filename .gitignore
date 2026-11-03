@@ -1,6 +1,7 @@
 node_modules
 .env
-.env.local
+.env.*
+!.env.example
 client_secret_*.json
 *.log
 .DS_Store
