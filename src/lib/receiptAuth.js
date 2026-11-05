@@ -18,6 +18,20 @@ function fromDomain(fromValue) {
   return match ? match[1] : null;
 }
 
+// Gmail ignores dots and +tags, so a.b+shop@gmail.com and ab@gmail.com are the same mailbox.
+function normalizeMailbox(address) {
+  const [local, domain] = String(address || '').trim().toLowerCase().split('@');
+  if (!local || !domain) return null;
+  if (domain === 'gmail.com' || domain === 'googlemail.com') {
+    return `${local.split('+')[0].replace(/\./g, '')}@gmail.com`;
+  }
+  return `${local}@${domain}`;
+}
+
+function addressesIn(headerValue) {
+  return (String(headerValue || '').match(/[^\s<>,;"']+@[^\s<>,;"']+/g) || []).map(normalizeMailbox);
+}
+
 /**
  * Checks one Authentication-Results value for an aligned DKIM pass or a DMARC pass for the sender domain.
  */
@@ -35,13 +49,29 @@ function hasAlignedPass(results) {
  * `headers` is the message's header list in order, top first: [{ name, value }].
  * Only the topmost Authentication-Results header is used, because that is the one the receiving
  * server added. Lower ones may have been written by the sender and cannot be trusted.
+ *
+ * `recipient` is the mailbox being read. A DKIM signature survives resending, so someone with their own
+ * FamApp account could send a genuine receipt for a payment THEY received to the merchant's inbox.
+ * The signed To header still names them, which is what the recipient check catches.
  * Returns { ok: true } or { ok: false, reason }.
  */
-function verifyReceiptSender(headers) {
+function verifyReceiptSender(headers, { recipient } = {}) {
   const list = Array.isArray(headers) ? headers : [];
   const find = (name) => list.filter((h) => String(h.name).toLowerCase() === name).map((h) => String(h.value).replace(/\s+/g, ' '));
 
-  const from = find('from')[0];
+  // Extra headers can be added to a signed message without breaking its signature, so there must be one of each.
+  const fromHeaders = find('from');
+  const toHeaders = find('to');
+  if (fromHeaders.length !== 1 || toHeaders.length !== 1) {
+    return { ok: false, reason: 'message must have exactly one From and one To header' };
+  }
+
+  const expectedRecipient = normalizeMailbox(recipient);
+  if (!expectedRecipient || !addressesIn(toHeaders[0]).includes(expectedRecipient)) {
+    return { ok: false, reason: 'receipt is addressed to a different mailbox' };
+  }
+
+  const from = fromHeaders[0];
   if (!isSenderDomain(fromDomain(from))) {
     return { ok: false, reason: `sender ${from || '(none)'} is not a FamApp address` };
   }

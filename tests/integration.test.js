@@ -64,7 +64,7 @@ If this was not done by you, call us...`;
   console.log(`📩 Simulated Email: ₹${parsed.amount} | Txn: ${parsed.transactionId} | UTR: ${parsed.utr}`);
 
   // 4. Process Incoming Payment
-  const result = await processIncomingPayment(parsed, mockEmail);
+  const result = await processIncomingPayment(parsed, mockEmail, merchant.id);
   assert.strictEqual(result.status, 'PAID', 'Payment should reconcile and mark order PAID');
   assert.strictEqual(result.orderId, testOrderId, 'Should match our test order ID');
   console.log(`✅ Auto-Reconciliation Succeeded: Order ${result.orderId} marked PAID!`);
@@ -83,7 +83,7 @@ If this was not done by you, call us...`;
 
   // 6. Test Replay Attack Prevention
   console.log('🔒 Testing Replay Attack / Double Claim Prevention...');
-  const replayResult = await processIncomingPayment(parsed, mockEmail);
+  const replayResult = await processIncomingPayment(parsed, mockEmail, merchant.id);
   assert.strictEqual(replayResult.status, 'ALREADY_CLAIMED', 'Duplicate payment must be rejected');
   console.log('✅ Replay Attack Blocked: Duplicate payment rejected with ALREADY_CLAIMED!');
 

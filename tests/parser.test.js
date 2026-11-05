@@ -1,6 +1,5 @@
 const assert = require('assert');
 const { parseFamPayEmail } = require('../src/services/emailParser');
-const { compareNames, matchesPayer } = require('../src/services/matcher');
 
 console.log('🧪 Starting Parser & Matcher Unit Tests...\n');
 
@@ -52,41 +51,19 @@ assert.strictEqual(parsed2.utr, '887766554433', 'UTR should match');
 assert.strictEqual(parsed2.senderName, 'RAHUL SHARMA', 'Sender name should match');
 console.log('✅ Test 2 Passed: Comma-formatted rupee amounts parse cleanly.');
 
-// Test Case 3: Name token matching (Fuzzy token comparison)
-assert.strictEqual(
-  compareNames('Aarav Sharma', 'SHARMA AARAV KUMAR'),
-  true,
-  'Customer "Aarav Sharma" should match bank sender "SHARMA AARAV KUMAR"'
-);
-assert.strictEqual(
-  compareNames('Rahul', 'SHARMA AARAV KUMAR'),
-  false,
-  'Customer "Rahul" should NOT match "SHARMA AARAV KUMAR"'
-);
-assert.strictEqual(
-  compareNames('Amit Kumar', 'AMIT SINGH'),
-  true,
-  '"Amit Kumar" shares token "amit" with "AMIT SINGH"'
-);
-console.log('✅ Test 3 Passed: Name token matching works as expected.');
-
-// Test Case 4: matchesPayer evaluates both customer_name and customer_email
-assert.strictEqual(
-  matchesPayer(
-    { customer_name: 'test_user', customer_email: 'aarav.sharma@gmail.com' },
-    'SHARMA AARAV KUMAR'
-  ),
-  true,
-  'Email handle with matching name tokens should match payer'
-);
-assert.strictEqual(
-  matchesPayer(
-    { customer_name: 'ihackers143', customer_email: 'ihackers143@gmail.com' },
-    'SHARMA AARAV KUMAR'
-  ),
-  false,
-  'Unrelated handle should not match'
-);
-console.log('✅ Test 4 Passed: matchesPayer email handle token fallback works as expected.');
+// Test Case 3: The payer controls their UPI display name, which is printed inside the receipt
+const injectedName = (name) => `Hey Merchant,
+You have successfully received
+₹500.0
+from ${name}
+Transaction ID :
+FMPIB6910395893
+UTR :
+945756689182`;
+assert.strictEqual(parseFamPayEmail(injectedName('Transaction ID FAKE12345')), null, 'A second transaction ID must reject the receipt');
+assert.strictEqual(parseFamPayEmail(injectedName('UTR 111111111111')), null, 'A second UTR must reject the receipt');
+assert.strictEqual(parseFamPayEmail(injectedName('successfully received ₹1.0')), null, 'A second amount must reject the receipt');
+assert.strictEqual(parseFamPayEmail(injectedName('AARAV SHARMA')).transactionId, 'FMPIB6910395893', 'A normal name still parses');
+console.log('✅ Test 3 Passed: Values injected through the payer name are rejected.');
 
 console.log('\n🎉 ALL TESTS PASSED SUCCESSFULLY!');

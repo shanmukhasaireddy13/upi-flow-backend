@@ -1,8 +1,8 @@
 /**
- * Fixed-window rate limiter keyed by client IP. Keeps state in memory, which is fine for a single
+ * Fixed-window rate limiter keyed by client IP, or by `keyFrom(req)` when given. Keeps state in memory, which is fine for a single
  * instance. Put a shared store in front of it if the backend is scaled out.
  */
-function createRateLimiter({ name, windowMs, max }) {
+function createRateLimiter({ name, windowMs, max, keyFrom = (req) => req.ip }) {
   const hits = new Map();
 
   const sweep = setInterval(() => {
@@ -14,7 +14,7 @@ function createRateLimiter({ name, windowMs, max }) {
   sweep.unref();
 
   return function rateLimit(req, res, next) {
-    const key = `${name}:${req.ip}`;
+    const key = `${name}:${keyFrom(req)}`;
     const now = Date.now();
     const entry = hits.get(key);
 

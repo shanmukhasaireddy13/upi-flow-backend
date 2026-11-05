@@ -140,6 +140,33 @@ async function activateGmailWatch(merchant) {
 }
 
 /**
+ * Gmail stops sending push notifications when a watch expires, after at most 7 days, and nothing reports it:
+ * payments just stop confirming. This renews every watch that expires within the next two days.
+ */
+async function renewExpiringWatches() {
+  const { data: merchants, error } = await supabase
+    .from('merchants')
+    .select('*')
+    .not('google_refresh_token', 'is', null);
+
+  if (error) {
+    console.error('[GMAIL WATCH] Could not load merchants for renewal:', error.message);
+    return;
+  }
+
+  const renewBefore = Date.now() + 2 * 24 * 60 * 60 * 1000;
+  for (const merchant of merchants) {
+    const expiry = Number(merchant.gmail_watch_expiry) || Date.parse(merchant.gmail_watch_expiry) || 0;
+    if (expiry > renewBefore) continue;
+    try {
+      await activateGmailWatch(merchant);
+    } catch (err) {
+      console.error(`[GMAIL WATCH] Renewal failed for merchant ${merchant.id}:`, err.message);
+    }
+  }
+}
+
+/**
  * Helper to recursively decode Gmail message body parts (uses base64url).
  */
 function extractBodyFromPayload(payload) {
@@ -196,7 +223,9 @@ async function processGmailPushNotification(emailAddress, historyId) {
     .from('orders')
     .select('id, amount, created_at')
     .eq('merchant_id', merchant.id)
-    .eq('status', 'PENDING')
+    // EXPIRED counts too: the checkout marks orders expired after 5 minutes, and a customer who paid
+    // just after that must still be confirmed instead of losing their money to a skipped scan.
+    .in('status', ['PENDING', 'EXPIRED'])
     .gte('created_at', fifteenMinutesAgo);
 
   if (orderLookupErr) {
@@ -223,7 +252,7 @@ async function processGmailPushNotification(emailAddress, historyId) {
   const listRes = await gmail.users.messages.list({
     userId: 'me',
     q: `from:famapp.in "successfully received" after:${afterEpochSec}`,
-    maxResults: 10
+    maxResults: 25
   });
 
   const messages = listRes.data.messages || [];
@@ -248,7 +277,7 @@ async function processGmailPushNotification(emailAddress, historyId) {
       continue;
     }
 
-    const sender = verifyReceiptSender(fullMsg.data.payload.headers);
+    const sender = verifyReceiptSender(fullMsg.data.payload.headers, { recipient: merchant.google_email });
     if (!sender.ok) {
       console.warn(`[GMAIL SYNC] Ignored message ${msg.id}: ${sender.reason}`);
       continue;
@@ -266,7 +295,8 @@ async function processGmailPushNotification(emailAddress, historyId) {
       }
 
       console.log(`[GMAIL SYNC] Parsed matching FamApp payment: ₹${parsedPayment.amount} (${parsedPayment.transactionId})`);
-      await processIncomingPayment(parsedPayment, bodyText, merchant.id);
+      const paidAt = isNaN(msgInternalDate) ? null : new Date(msgInternalDate);
+      await processIncomingPayment(parsedPayment, bodyText, merchant.id, 'production', paidAt);
     }
   }
 }
@@ -277,5 +307,6 @@ module.exports = {
   generateAuthUrl,
   handleOAuthCallback,
   activateGmailWatch,
+  renewExpiringWatches,
   processGmailPushNotification
 };

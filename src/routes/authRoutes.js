@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/authenticate');
+const { authenticate, requireSession } = require('../middleware/authenticate');
 const { createRateLimiter } = require('../lib/rateLimit');
 const {
   merchantSignup,
@@ -15,10 +15,10 @@ const authLimiter = createRateLimiter({ name: 'auth', windowMs: 15 * 60 * 1000, 
 
 router.post('/signup', authLimiter, merchantSignup);
 router.post('/login', authLimiter, merchantLogin);
-router.get('/me', authenticate, getCurrentMerchant);
+router.get('/me', authenticate, requireSession, getCurrentMerchant);
 
-router.get('/google/connect', authenticate, getGoogleAuthUrl);
+router.get('/google/connect', authenticate, requireSession, getGoogleAuthUrl);
 router.get('/google/callback', handleGoogleCallback);
-router.post('/google/watch', authenticate, renewGmailWatch);
+router.post('/google/watch', authenticate, requireSession, renewGmailWatch);
 
 module.exports = router;

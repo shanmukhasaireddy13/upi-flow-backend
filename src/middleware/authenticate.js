@@ -42,10 +42,23 @@ async function authenticate(req, res, next) {
     }
     req.merchant = merchant;
     req.environment = environment;
+    req.authMethod = session ? 'session' : 'api_key';
     return next();
   } catch (err) {
     return next(err);
   }
 }
 
-module.exports = { authenticate };
+/**
+ * For account management. API keys create and read orders only, so a leaked key cannot change
+ * the merchant's UPI ID (where customers' money goes), read secrets, or rotate credentials.
+ * Must run after authenticate.
+ */
+function requireSession(req, res, next) {
+  if (req.authMethod !== 'session') {
+    return res.status(403).json({ error: 'This action requires signing in to the dashboard. API keys cannot be used.' });
+  }
+  return next();
+}
+
+module.exports = { authenticate, requireSession };

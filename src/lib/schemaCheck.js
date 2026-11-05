@@ -5,6 +5,7 @@ const { supabase } = require('../config/supabase');
 const REQUIRED = [
   { table: 'fampay_ledger', column: 'merchant_id' },
   { table: 'orders', column: 'merchant_id' },
+  { table: 'orders', column: 'idempotency_key' },
   { table: 'merchants', column: 'google_email' }
 ];
 
@@ -20,7 +21,7 @@ async function checkSchema() {
   }
   console.error('[SCHEMA] Missing or unreadable columns:');
   missing.forEach((m) => console.error(`  - ${m}`));
-  console.error('[SCHEMA] Run backend/migrations/001_security_and_attribution.sql in the Supabase SQL editor.');
+  console.error('[SCHEMA] Run the files in backend/migrations in order in the Supabase SQL editor.');
   return false;
 }
 

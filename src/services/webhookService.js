@@ -1,5 +1,7 @@
 const crypto = require('crypto');
-const { isSafeOutboundUrl } = require('../lib/validation');
+const { isSafeOutboundUrl, resolvesToPublicAddress } = require('../lib/validation');
+
+const RETRY_DELAYS_MS = [30 * 1000, 5 * 60 * 1000, 30 * 60 * 1000];
 
 /**
  * Signs a payload as HMAC-SHA256 over "<timestamp>.<body>".
@@ -41,10 +43,10 @@ async function deliverWebhook(merchant, envelope, environment = 'production') {
   const targetSecret = isDev && merchant.test_webhook_secret ? merchant.test_webhook_secret : merchant.webhook_secret;
 
   if (!merchant || !targetUrl) {
-    return { delivered: false, reason: 'No webhook URL configured' };
+    return { delivered: false, retryable: false, reason: 'No webhook URL configured' };
   }
-  if (!isSafeOutboundUrl(targetUrl)) {
-    return { delivered: false, reason: 'Webhook URL is not allowed' };
+  if (!isSafeOutboundUrl(targetUrl) || !(await resolvesToPublicAddress(targetUrl))) {
+    return { delivered: false, retryable: false, reason: 'Webhook URL is not allowed' };
   }
 
   const bodyString = JSON.stringify(envelope);
@@ -70,7 +72,9 @@ async function deliverWebhook(merchant, envelope, environment = 'production') {
     });
     return { delivered: response.ok, status: response.status };
   } catch (err) {
-    return { delivered: false, reason: err.name === 'AbortError' ? 'Timed out' : err.message };
+    // Connection details stay in the log: returning them would let merchants probe the network from here.
+    console.error('[WEBHOOK] Delivery error:', err.message);
+    return { delivered: false, reason: err.name === 'AbortError' ? 'Timed out' : 'Could not connect to the webhook URL' };
   } finally {
     clearTimeout(timeout);
   }
@@ -79,13 +83,23 @@ async function deliverWebhook(merchant, envelope, environment = 'production') {
 /**
  * Dispatches an order event (e.g. order.paid) to the merchant. Failures are logged, never thrown,
  * so a broken merchant endpoint cannot roll back a payment that was already reconciled.
+ * Failed deliveries are retried with the same event id, so merchants can de-duplicate on it.
+ * Retries live in memory: a restart drops them, and merchants can still poll the order status.
  */
-async function dispatchMerchantWebhook(merchant, eventType, order) {
-  const result = await deliverWebhook(merchant, buildEnvelope(eventType, order), order.environment || 'production');
+async function dispatchMerchantWebhook(merchant, eventType, order, envelope = buildEnvelope(eventType, order), attempt = 0) {
+  const result = await deliverWebhook(merchant, envelope, order.environment || 'production');
   if (result.delivered) {
     console.log(`[WEBHOOK] ${eventType} for ${order.id} delivered (HTTP ${result.status})`);
-  } else {
-    console.error(`[WEBHOOK] ${eventType} for ${order.id} not delivered: ${result.reason || result.status}`);
+    return result;
+  }
+
+  console.error(`[WEBHOOK] ${eventType} for ${order.id} not delivered (attempt ${attempt + 1}): ${result.reason || result.status}`);
+  if (result.retryable !== false && attempt < RETRY_DELAYS_MS.length) {
+    setTimeout(() => {
+      dispatchMerchantWebhook(merchant, eventType, order, envelope, attempt + 1).catch((err) => {
+        console.error(`[WEBHOOK] Retry for ${order.id} failed:`, err.message);
+      });
+    }, RETRY_DELAYS_MS[attempt]).unref();
   }
   return result;
 }

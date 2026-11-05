@@ -1,6 +1,6 @@
 const express = require('express');
 const router = express.Router();
-const { authenticate } = require('../middleware/authenticate');
+const { authenticate, requireSession } = require('../middleware/authenticate');
 const { createRateLimiter } = require('../lib/rateLimit');
 const {
   getMerchantProfile,
@@ -14,7 +14,7 @@ const {
 
 const sensitiveLimiter = createRateLimiter({ name: 'merchant-sensitive', windowMs: 60 * 1000, max: 10 });
 
-router.use(authenticate);
+router.use(authenticate, requireSession);
 
 router.get('/profile', getMerchantProfile);
 router.get('/onboarding', getOnboarding);

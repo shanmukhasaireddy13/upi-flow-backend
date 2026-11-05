@@ -2,21 +2,56 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const { supabase } = require('../config/supabase');
 const { verifyOrderByUtrOrTxnId } = require('../services/matcher');
-const { parseAmount, parseString, isEmail, isOrderId, isValidRedirectUrl, isFamPayVpa } = require('../lib/validation');
+const { parseAmount, parseString, parseMetadata, isEmail, isOrderId, isValidRedirectUrl, isFamPayVpa } = require('../lib/validation');
 
 const ORDER_TTL_MS = 5 * 60 * 1000;
 const CHECKOUT_BASE_URL = (process.env.CHECKOUT_BASE_URL || 'http://localhost:3000').replace(/\/$/, '');
+const IDEMPOTENCY_KEY_PATTERN = /^[A-Za-z0-9_.:-]{1,128}$/;
 
 function buildUpiUri(upiId, payeeName, amount) {
-  return `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payeeName)}&am=${amount}&cu=INR`;
+  return `upi://pay?pa=${encodeURIComponent(upiId)}&pn=${encodeURIComponent(payeeName)}&am=${Number(amount).toFixed(2)}&cu=INR`;
 }
 
 function qrOptions() {
   return { width: 320, margin: 2, color: { dark: '#0a0b0d', light: '#ffffff' } };
 }
 
+function resolveRedirectUrl(url, orderId) {
+  if (!url) return null;
+  return url.replace(/\{ORDER_ID\}/g, orderId).replace(/\{CHECKOUT_SESSION_ID\}/g, orderId);
+}
+
+async function sendCreatedOrder(res, httpStatus, order, merchant) {
+  const upiUri = buildUpiUri(merchant.upi_id, merchant.upi_name || merchant.name, order.amount);
+  return res.status(httpStatus).json({
+    order_id: order.id,
+    amount: order.amount,
+    currency: 'INR',
+    customer_name: order.customer_name,
+    status: order.status,
+    expires_at: order.expires_at,
+    environment: order.environment,
+    upi_uri: upiUri,
+    qr_code: await QRCode.toDataURL(upiUri, qrOptions()),
+    checkout_url: `${CHECKOUT_BASE_URL}/checkout/${order.id}`,
+    success_url: resolveRedirectUrl(order.success_url, order.id),
+    cancel_url: order.cancel_url,
+    metadata: order.metadata || {}
+  });
+}
+
+function findOrderByIdempotencyKey(merchantId, key) {
+  return supabase
+    .from('orders')
+    .select('*')
+    .eq('merchant_id', merchantId)
+    .eq('idempotency_key', key)
+    .maybeSingle();
+}
+
 /**
  * Creates a payment order for the authenticated merchant and returns its UPI QR code.
+ * With an Idempotency-Key header, retrying a request returns the first order instead of creating another.
  */
 async function createOrder(req, res) {
   try {
@@ -34,7 +69,7 @@ async function createOrder(req, res) {
 
     let customerEmail = null;
     if (req.body.customer_email) {
-      customerEmail = String(req.body.customer_email).trim().toLowerCase();
+      customerEmail = typeof req.body.customer_email === 'string' ? req.body.customer_email.trim().toLowerCase() : '';
       if (!isEmail(customerEmail)) {
         return res.status(400).json({ error: 'Customer email is not valid' });
       }
@@ -56,9 +91,14 @@ async function createOrder(req, res) {
       cancelUrl = String(req.body.cancel_url).trim();
     }
 
-    let metadata = {};
-    if (req.body.metadata && typeof req.body.metadata === 'object' && !Array.isArray(req.body.metadata)) {
-      metadata = req.body.metadata;
+    const metadata = parseMetadata(req.body.metadata);
+    if (metadata === null) {
+      return res.status(400).json({ error: 'metadata must be a JSON object with at most 20 keys and 4 KB in total' });
+    }
+
+    const idempotencyKey = req.get('idempotency-key') || null;
+    if (idempotencyKey && !IDEMPOTENCY_KEY_PATTERN.test(idempotencyKey)) {
+      return res.status(400).json({ error: 'Idempotency-Key must be 1 to 128 letters, digits, or . _ : -' });
     }
 
     if (!merchant.upi_id || !isFamPayVpa(merchant.upi_id)) {
@@ -69,11 +109,22 @@ async function createOrder(req, res) {
       return res.status(400).json({ error: 'Connect your Gmail account in settings to verify payments before creating payments' });
     }
 
+    if (idempotencyKey) {
+      const { data: existing, error: lookupError } = await findOrderByIdempotencyKey(merchant.id, idempotencyKey);
+      if (lookupError) {
+        console.error('[ORDER] Idempotency lookup error:', lookupError.message);
+        return res.status(500).json({ error: 'Could not create the order' });
+      }
+      if (existing) {
+        if (Number(existing.amount) !== Number(amount)) {
+          return res.status(409).json({ error: 'This Idempotency-Key was already used for a different amount' });
+        }
+        return sendCreatedOrder(res, 200, existing, merchant);
+      }
+    }
+
     const orderId = `ord_${crypto.randomBytes(12).toString('base64url')}`;
     const expiresAt = new Date(Date.now() + ORDER_TTL_MS).toISOString();
-    const upiUri = buildUpiUri(merchant.upi_id, merchant.upi_name || merchant.name, amount);
-    const qrCode = await QRCode.toDataURL(upiUri, qrOptions());
-
     const env = 'production';
     const { data: order, error } = await supabase
       .from('orders')
@@ -88,38 +139,24 @@ async function createOrder(req, res) {
         environment: env,
         success_url: successUrl,
         cancel_url: cancelUrl,
-        metadata
+        metadata,
+        ...(idempotencyKey ? { idempotency_key: idempotencyKey } : {})
       })
       .select()
       .single();
+
+    // Two identical requests at the same moment: the unique index lets one through, the other returns it.
+    if (error && error.code === '23505' && idempotencyKey) {
+      const { data: winner } = await findOrderByIdempotencyKey(merchant.id, idempotencyKey);
+      if (winner) return sendCreatedOrder(res, 200, winner, merchant);
+    }
 
     if (error) {
       console.error('[ORDER] Insert error:', error.message);
       return res.status(500).json({ error: 'Could not create the order' });
     }
 
-    let resolvedSuccessUrl = null;
-    if (order.success_url) {
-      resolvedSuccessUrl = order.success_url
-        .replace(/\{ORDER_ID\}/g, order.id)
-        .replace(/\{CHECKOUT_SESSION_ID\}/g, order.id);
-    }
-
-    return res.status(201).json({
-      order_id: order.id,
-      amount: order.amount,
-      currency: 'INR',
-      customer_name: order.customer_name,
-      status: order.status,
-      expires_at: order.expires_at,
-      environment: order.environment,
-      upi_uri: upiUri,
-      qr_code: qrCode,
-      checkout_url: `${CHECKOUT_BASE_URL}/checkout/${order.id}`,
-      success_url: resolvedSuccessUrl,
-      cancel_url: order.cancel_url,
-      metadata: order.metadata || {}
-    });
+    return sendCreatedOrder(res, 201, order, merchant);
   } catch (err) {
     console.error('[ORDER] createOrder error:', err);
     return res.status(500).json({ error: 'Internal server error' });
@@ -138,7 +175,7 @@ async function getOrderStatus(req, res) {
       .from('orders')
       .select(`
         id, amount, customer_name, status, transaction_id, utr, expires_at, created_at, environment,
-        success_url, cancel_url, metadata,
+        success_url, cancel_url,
         merchants (
           name, upi_id, upi_name, brand_color, logo_url, checkout_title, checkout_subtitle, support_contact
         )
@@ -159,13 +196,6 @@ async function getOrderStatus(req, res) {
     const merchant = order.merchants || {};
     const timeLeft = Math.max(0, Math.floor((new Date(order.expires_at) - new Date()) / 1000));
 
-    let resolvedSuccessUrl = null;
-    if (order.success_url) {
-      resolvedSuccessUrl = order.success_url
-        .replace(/\{ORDER_ID\}/g, order.id)
-        .replace(/\{CHECKOUT_SESSION_ID\}/g, order.id);
-    }
-
     const response = {
       id: order.id,
       amount: order.amount,
@@ -175,9 +205,10 @@ async function getOrderStatus(req, res) {
       environment: order.environment || 'production',
       time_left_seconds: status === 'PENDING' ? timeLeft : 0,
       expires_at: order.expires_at,
-      success_url: resolvedSuccessUrl,
+      // The return URL stays hidden until the order is paid, so a payer cannot open the merchant's
+      // success page without paying. metadata is merchant data and is sent in webhooks only.
+      success_url: status === 'PAID' ? resolveRedirectUrl(order.success_url, order.id) : null,
       cancel_url: order.cancel_url || null,
-      metadata: order.metadata || {},
       merchant: {
         name: merchant.name || null,
         brand_color: merchant.brand_color || '#0052ff',

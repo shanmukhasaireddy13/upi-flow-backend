@@ -2,40 +2,11 @@ const { supabase } = require('../config/supabase');
 const { dispatchMerchantWebhook } = require('./webhookService');
 const { isPaymentReference } = require('../lib/validation');
 
-/**
- * Compares two names by extracting meaningful tokens (> 2 characters).
- * e.g., "Aarav Sharma" matches "SHARMA AARAV KUMAR"
- */
-function compareNames(customerName, senderName) {
-  if (!customerName || !senderName) return false;
-
-  const clean = (str) =>
-    str
-      .toLowerCase()
-      .replace(/[^a-z0-9 ]/g, '')
-      .split(/\s+/)
-      .filter((t) => t.length > 2);
-
-  const custTokens = clean(customerName);
-  const senderTokens = clean(senderName);
-
-  return custTokens.some((token) => senderTokens.includes(token));
-}
-
-/**
- * Checks if an order's customer name or email handle matches the sender name in the bank receipt.
- */
-function matchesPayer(order, senderName) {
-  if (!order || !senderName) return false;
-  if (compareNames(order.customer_name, senderName)) return true;
-
-  // Also check customer email prefix tokens (e.g., "aarav.sharma@gmail.com" matches "SHARMA")
-  if (order.customer_email) {
-    const handle = String(order.customer_email).split('@')[0].replace(/[._-]/g, ' ');
-    if (compareNames(handle, senderName)) return true;
-  }
-  return false;
-}
+// How long after an order is created a payment can still settle it (late payments, delayed emails).
+const MATCH_WINDOW_MS = 60 * 60 * 1000;
+// Order times come from the database clock and receipt times from Gmail or this server. They can
+// differ by a few seconds, which must not make a fast payment look older than its order.
+const CLOCK_TOLERANCE_MS = 30 * 1000;
 
 async function markOrderPaid(order, transactionId, utr) {
   const { data: reconciled, error } = await supabase.rpc('reconcile_fampay_payment', {
@@ -91,12 +62,20 @@ async function markOrderPaid(order, transactionId, utr) {
   return { ok: true };
 }
 
+// Delivery retries in the background, so a slow merchant endpoint cannot hold up the payer's request.
+function notifyMerchant(merchant, paidOrder) {
+  dispatchMerchantWebhook(merchant, 'order.paid', paidOrder).catch((err) => {
+    console.error(`[WEBHOOK] order.paid for ${paidOrder.id} failed:`, err.message);
+  });
+}
+
 /**
  * Reconciles an incoming parsed FamApp payment with pending orders of ONE merchant.
  * The merchant must be known (resolved from the receiving Gmail account or the authenticated caller).
  * Without it we cannot tell whose payment this is, so it is stored unclaimed rather than matched.
+ * `paidAt` is when the mail server received the receipt, when known.
  */
-async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId = null, environment = 'production') {
+async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId = null, environment = 'production', paidAt = null) {
   const { amount, transactionId, senderName, dateRaw, updatedBalance, utr } = parsedPayment;
 
   if (!merchantId) {
@@ -104,7 +83,7 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     return { status: 'STORED_UNCLAIMED', transactionId };
   }
 
-  // 1. Check if this transaction was already processed and claimed
+  // 1. A payment is only ever used once, and only by the merchant it belongs to.
   const { data: existingLedger } = await supabase
     .from('fampay_ledger')
     .select('*')
@@ -114,16 +93,23 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
   if (existingLedger && existingLedger.claimed) {
     return { status: 'ALREADY_CLAIMED', transactionId };
   }
+  if (existingLedger && existingLedger.merchant_id && existingLedger.merchant_id !== merchantId) {
+    return { status: 'OTHER_MERCHANT', transactionId };
+  }
 
-  // 2. Pending, unexpired orders of this merchant with the same amount and environment.
-  let { data: pendingOrders, error: orderError } = await supabase
+  // 2. Unpaid orders of this merchant with the same amount that existed when this payment was made.
+  //    The window is anchored to the payment, not to the current time, so an old receipt (which can be
+  //    looked at again on every Gmail sync) can never settle an order created after it.
+  const receivedAt = new Date(paidAt || (existingLedger && existingLedger.received_at) || Date.now());
+  const { data: candidates, error: orderError } = await supabase
     .from('orders')
     .select('*, merchants(*)')
     .eq('merchant_id', merchantId)
     .eq('environment', environment)
-    .eq('status', 'PENDING')
+    .in('status', ['PENDING', 'EXPIRED'])
     .eq('amount', amount)
-    .gt('expires_at', new Date().toISOString())
+    .gte('created_at', new Date(receivedAt.getTime() - MATCH_WINDOW_MS).toISOString())
+    .lte('created_at', new Date(receivedAt.getTime() + CLOCK_TOLERANCE_MS).toISOString())
     .order('created_at', { ascending: true });
 
   if (orderError) {
@@ -131,48 +117,14 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     return { status: 'ERROR', error: orderError.message };
   }
 
-  // Grace fallback: search for orders created within the last 60 minutes
-  if (!pendingOrders || pendingOrders.length === 0) {
-    const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const { data: recentOrders } = await supabase
-      .from('orders')
-      .select('*, merchants(*)')
-      .eq('merchant_id', merchantId)
-      .eq('environment', environment)
-      .in('status', ['PENDING', 'EXPIRED'])
-      .eq('amount', amount)
-      .gte('created_at', sixtyMinutesAgo)
-      .order('created_at', { ascending: false });
-
-    if (recentOrders && recentOrders.length > 0) {
-      pendingOrders = recentOrders;
-    } else if (environment === 'production') {
-      // Check if this merchant created an order in dev mode
-      const { data: devOrders } = await supabase
-        .from('orders')
-        .select('*, merchants(*)')
-        .eq('merchant_id', merchantId)
-        .eq('environment', 'dev')
-        .in('status', ['PENDING', 'EXPIRED'])
-        .eq('amount', amount)
-        .gte('created_at', sixtyMinutesAgo)
-        .order('created_at', { ascending: false });
-
-      if (devOrders && devOrders.length > 0) {
-        pendingOrders = devOrders;
-      }
-    }
-  }
-
   // If no matching order was created for this merchant and amount, IGNORE the receipt.
   // We do NOT write to fampay_ledger for unrelated personal or past payments!
-  if (!pendingOrders || pendingOrders.length === 0) {
-    console.log(`[MATCHER] Unrelated payment of ₹${amount} (Txn: ${transactionId}) ignored: no active order found for merchant.`);
+  if (!candidates || candidates.length === 0) {
+    console.log(`[MATCHER] Unrelated payment of ₹${amount} (Txn: ${transactionId}) ignored: no matching order for merchant.`);
     return { status: 'IGNORED_NO_MATCHING_ORDER', transactionId };
   }
 
   // 3. Now that a matching order is confirmed, record in the ledger.
-  const targetEnv = pendingOrders[0].environment || environment;
   const { error: ledgerError } = await supabase
     .from('fampay_ledger')
     .upsert(
@@ -185,7 +137,8 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
         updated_balance: updatedBalance,
         raw_email: rawEmail,
         merchant_id: merchantId,
-        environment: targetEnv
+        environment,
+        ...(paidAt ? { received_at: receivedAt.toISOString() } : {})
       },
       { onConflict: 'transaction_id', ignoreDuplicates: true }
     );
@@ -195,53 +148,20 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
     return { status: 'ERROR', error: ledgerError.message };
   }
 
-  // 4. Lone order: match. Several orders for the same amount: match on name/email first, then smart recency.
-  let matchedOrder = null;
-  if (pendingOrders.length === 1) {
-    matchedOrder = pendingOrders[0];
-  } else {
-    // A. Priority 1: Customer name or email handle token match
-    matchedOrder = pendingOrders.find((ord) => matchesPayer(ord, senderName)) || null;
-
-    // B. Priority 2: Smart Recency Disambiguation
-    if (!matchedOrder) {
-      const sortedByRecency = [...pendingOrders].sort(
-        (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-      );
-      const newest = sortedByRecency[0];
-      const secondNewest = sortedByRecency[1];
-
-      const nowMs = Date.now();
-      const newestAgeSec = Math.max(0, Math.floor((nowMs - new Date(newest.created_at).getTime()) / 1000));
-      const secondAgeSec = Math.max(0, Math.floor((nowMs - new Date(secondNewest.created_at).getTime()) / 1000));
-      const ageGapSec = secondAgeSec - newestAgeSec;
-
-      // Match the newest order if it was created within the last 4 minutes (240s) AND either:
-      // - The newer order is at least 45 seconds fresher than the older order, OR
-      // - The older order was created >= 150 seconds (2.5+ minutes) ago
-      if (newestAgeSec <= 240 && (ageGapSec >= 45 || secondAgeSec >= 150)) {
-        console.log(`[MATCHER] Smart Recency: Resolved collision for ₹${amount}. Selected newest order ${newest.id} (created ${newestAgeSec}s ago vs older candidate ${secondAgeSec}s ago).`);
-        matchedOrder = newest;
-      }
-    }
-
-    if (!matchedOrder) {
-      console.warn(`[MATCHER] Unresolved collision for ₹${amount}. Multiple concurrent orders within tight time window: ${pendingOrders.map((o) => o.id).join(', ')}`);
-      return {
-        status: 'COLLISION_PENDING_CONFIRMATION',
-        transactionId,
-        candidateOrders: pendingOrders.map((o) => o.id)
-      };
-    }
+  // 4. Only an unambiguous match is automatic. With several orders for one amount the receipt cannot say
+  //    whose payment this is. Guessing from the customer name or the newest order would let a customer
+  //    choose a name, or open a fresh order, to get another person's payment applied to their own order.
+  //    Those orders stay open and the real payer confirms with the UTR, which only they know.
+  if (candidates.length > 1) {
+    console.warn(`[MATCHER] ${candidates.length} open orders for ₹${amount}; waiting for the payer's UTR on ${transactionId}`);
+    return {
+      status: 'COLLISION_PENDING_CONFIRMATION',
+      transactionId,
+      candidateOrders: candidates.map((o) => o.id)
+    };
   }
 
-  // Ensure ledger environment matches order environment before atomic reconciliation
-  if (targetEnv !== matchedOrder.environment) {
-    await supabase
-      .from('fampay_ledger')
-      .update({ environment: matchedOrder.environment })
-      .eq('transaction_id', transactionId);
-  }
+  const matchedOrder = candidates[0];
 
   // 5. Atomic reconciliation in PostgreSQL.
   const result = await markOrderPaid(matchedOrder, transactionId, utr);
@@ -250,7 +170,7 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
   }
 
   const paidOrder = { ...matchedOrder, status: 'PAID', transaction_id: transactionId, utr };
-  await dispatchMerchantWebhook(matchedOrder.merchants, 'order.paid', paidOrder);
+  notifyMerchant(matchedOrder.merchants, paidOrder);
   return { status: 'PAID', orderId: matchedOrder.id, transactionId, utr };
 }
 
@@ -259,7 +179,7 @@ async function processIncomingPayment(parsedPayment, rawEmail = null, merchantId
  * Only payments attributed to the order's own merchant and with the exact amount can be claimed.
  */
 async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
-  const reference = String(referenceInput || '').trim();
+  const reference = typeof referenceInput === 'string' ? referenceInput.trim() : '';
   if (!isPaymentReference(reference)) {
     return { success: false, message: 'Enter the 12-digit UTR or the FamPay transaction ID' };
   }
@@ -274,10 +194,9 @@ async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
     return { success: false, message: 'Order not found' };
   }
   if (order.status === 'PAID') {
-    return { success: true, message: 'This order is already paid', orderId: order.id, utr: order.utr };
+    return { success: true, message: 'This order is already paid', orderId: order.id };
   }
-  const sixtyMinutesAgo = new Date(Date.now() - 60 * 60 * 1000);
-  const isRecent = new Date(order.created_at) >= sixtyMinutesAgo;
+  const isRecent = Date.now() - new Date(order.created_at).getTime() <= MATCH_WINDOW_MS;
   if (!['PENDING', 'EXPIRED'].includes(order.status) || !isRecent) {
     return { success: false, message: 'This checkout session has expired' };
   }
@@ -292,18 +211,17 @@ async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
     .or(`utr.eq.${reference},transaction_id.eq.${reference}`)
     .limit(1);
 
-  if (ledgerError || !entries || entries.length === 0) {
-    return {
-      success: false,
-      message: 'No matching unclaimed payment found. If you just paid, wait a few seconds and try again.'
-    };
-  }
+  // Same answer for every failure, so nobody can use this endpoint to learn what other payers paid.
+  // A payment made before this order existed, or for a different amount, cannot settle it.
+  const ledger = entries && entries[0];
+  const isValidClaim = !ledgerError && ledger &&
+    Number(ledger.amount) === Number(order.amount) &&
+    new Date(ledger.received_at).getTime() + CLOCK_TOLERANCE_MS >= new Date(order.created_at).getTime();
 
-  const ledger = entries[0];
-  if (Number(ledger.amount) !== Number(order.amount)) {
+  if (!isValidClaim) {
     return {
       success: false,
-      message: `This payment is ₹${ledger.amount}, but the order is ₹${order.amount}`
+      message: 'No matching payment found for this order. Check the UTR and the amount you paid. If you just paid, wait a few seconds and try again.'
     };
   }
 
@@ -313,7 +231,7 @@ async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
   }
 
   const paidOrder = { ...order, status: 'PAID', transaction_id: ledger.transaction_id, utr: ledger.utr };
-  await dispatchMerchantWebhook(order.merchants, 'order.paid', paidOrder);
+  notifyMerchant(order.merchants, paidOrder);
 
   return {
     success: true,
@@ -326,7 +244,5 @@ async function verifyOrderByUtrOrTxnId(orderId, referenceInput) {
 
 module.exports = {
   processIncomingPayment,
-  verifyOrderByUtrOrTxnId,
-  compareNames,
-  matchesPayer
+  verifyOrderByUtrOrTxnId
 };

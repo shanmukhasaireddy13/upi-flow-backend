@@ -23,6 +23,22 @@ async function resolveMerchantIdByEmail(email) {
   return data && data[0] ? data[0].id : null;
 }
 
+// A forwarder may send an already parsed payment. It is authenticated, but its fields are still checked.
+function normalizeForwardedPayment(payment) {
+  const amount = parseAmount(payment && payment.amount);
+  const transactionId = payment && payment.transactionId;
+  if (!amount || typeof transactionId !== 'string' || !/^[A-Za-z0-9]{6,64}$/.test(transactionId)) return null;
+  if (payment.utr && !/^\d{12}$/.test(String(payment.utr))) return null;
+  return {
+    amount: Number(amount),
+    transactionId,
+    utr: payment.utr ? String(payment.utr) : null,
+    senderName: typeof payment.senderName === 'string' ? payment.senderName.slice(0, 120) : null,
+    dateRaw: typeof payment.dateRaw === 'string' ? payment.dateRaw.slice(0, 80) : null,
+    updatedBalance: Number.isFinite(payment.updatedBalance) ? payment.updatedBalance : null
+  };
+}
+
 /**
  * Ingestion endpoint for a trusted forwarder (Cloudflare Email Worker or similar).
  * Requires GATEWAY_SECRET. If the secret is not configured, the endpoint is disabled.
@@ -41,7 +57,9 @@ async function handleEmailWebhook(req, res) {
 
     const { rawEmail, text, body, parsedPayment, merchant_email, merchant_id } = req.body || {};
     const emailContent = rawEmail || text || body;
-    const paymentData = parsedPayment || (emailContent ? parseFamPayEmail(emailContent) : null);
+    const paymentData = parsedPayment
+      ? normalizeForwardedPayment(parsedPayment)
+      : (typeof emailContent === 'string' ? parseFamPayEmail(emailContent) : null);
 
     if (!paymentData) {
       return res.status(400).json({ error: 'Unable to parse a FamApp payment from the request body' });

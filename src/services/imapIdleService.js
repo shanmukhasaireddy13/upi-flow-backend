@@ -94,7 +94,7 @@ class ImapIdleService {
             name: key,
             value: line.slice(line.indexOf(':') + 1)
           }));
-          const sender = verifyReceiptSender(headers);
+          const sender = verifyReceiptSender(headers, { recipient: this.user });
           if (!sender.ok) {
             console.warn(`[IMAP IDLE] Ignored message ${msgId}: ${sender.reason}`);
             return;
@@ -112,7 +112,7 @@ class ImapIdleService {
             .maybeSingle();
 
           console.log(`[IMAP IDLE] Parsed FamApp receipt: ₹${parsedPayment.amount} (${parsedPayment.transactionId})`);
-          await processIncomingPayment(parsedPayment, rawBody, merchant ? merchant.id : null);
+          await processIncomingPayment(parsedPayment, rawBody, merchant ? merchant.id : null, 'production', parsed.date || null);
         });
       });
     });

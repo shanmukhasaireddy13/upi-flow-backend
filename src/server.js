@@ -8,9 +8,11 @@ const authRoutes = require('./routes/authRoutes');
 const { corsMiddleware, securityHeaders } = require('./middleware/security');
 const { ImapIdleService } = require('./services/imapIdleService');
 const { checkSchema } = require('./lib/schemaCheck');
+const { renewExpiringWatches } = require('./services/googleAuthService');
 
 const app = express();
 const PORT = process.env.PORT || 5000;
+const WATCH_RENEWAL_INTERVAL_MS = 6 * 60 * 60 * 1000;
 
 app.set('trust proxy', process.env.TRUST_PROXY === 'true' ? 1 : false);
 app.use(securityHeaders);
@@ -50,4 +52,9 @@ app.listen(PORT, () => {
   // IMAP IDLE push daemon runs only when IMAP credentials are configured
   const imapService = new ImapIdleService();
   imapService.start();
+
+  if (process.env.GOOGLE_PUBSUB_TOPIC) {
+    renewExpiringWatches();
+    setInterval(renewExpiringWatches, WATCH_RENEWAL_INTERVAL_MS).unref();
+  }
 });
